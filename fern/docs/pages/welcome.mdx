@@ -1,0 +1,115 @@
+# Summarize
+
+**Local-first multi-source video summarization** (YouTube, social, drives, files) with any OpenAI-compatible LLM, optional vision path, and NotebookLM-style workflows.
+
+<p align="center">
+  <img alt="sample" src="/assets/images/summarize_sample.gif" />
+</p>
+
+<Callout type="info">
+  **Not [steipete/summarize](https://github.com/steipete/summarize)** — This is a **self-hosted video pipeline** with transcript cache, Cobalt fallback, Streamlit workspace, and an agent skill. Steipete's project is a generic URL clipper.
+</Callout>
+
+Bring your own API keys. All configuration lives in `summarizer.yaml` and `.env`.
+
+More background on this project: [martino.im/Summarize](https://martino.im/Summarize.html).
+
+<CardGroup cols={2}>
+  <Card title="11+ Platforms" icon="fa-brands fa-youtube">
+    YouTube, Instagram, TikTok, Twitter/X, Reddit, Facebook, Google Drive, Dropbox, local files
+  </Card>
+  <Card title="Any LLM" icon="fa-solid fa-brain">
+    OpenAI, Groq, Gemini, Ollama, OpenRouter, NVIDIA, Perplexity, LiteLLM, and any OpenAI-compatible endpoint
+  </Card>
+  <Card title="Two Modes" icon="fa-solid fa-eye">
+    Audio transcription + text summary, or visual mode sending video directly to vision-capable models
+  </Card>
+  <Card title="Summary Styles" icon="fa-solid fa-palette">
+    Q&A, distillation, fact-checking, tutorials, Mermaid diagrams, essays, and more. Add your own instantly by editing `summarizer/prompts.json`.
+  </Card>
+  <Card title="Web UI" icon="fa-solid fa-window-maximize">
+    Streamlit interface with history, Mermaid rendering, themes, and one-click share
+  </Card>
+  <Card title="Docker Ready" icon="fa-brands fa-docker">
+    Full-stack Compose with optional Cobalt and proxy support
+  </Card>
+</CardGroup>
+
+## Requirements
+
+- **Python** 3.7+
+- **ffmpeg** (must be on `PATH`)
+- At least one **LLM API key** in `.env`
+- **Cobalt** fallback downloader for URLs that yt-dlp cannot handle (included in Docker Compose). See [Cobalt](integrations/cobalt).
+
+## Quick Start
+
+Install in an **isolated environment** (pipx recommended) so other Python tools cannot break summarizer. See [Installation](getting-started/installation) for venv, Docker, and development setup.
+
+You need any OpenAI-compatible API key in `.env` (for example [Groq](https://groq.com/) `GROQ_API_KEY` is free-tier friendly; `OPENAI_API_KEY` works with `--provider openai`).
+
+```bash
+pipx install martino-summarize
+summarizer --init-config
+echo "GROQ_API_KEY=your_key_here" > .env
+summarizer --source "https://www.youtube.com/watch?v=arj7oStGLkU"
+```
+
+The summary is saved to `summaries/watch_YYYYMMDD_HHMMSS.md`.
+
+For the HTTP API or all extras:
+
+```bash
+pipx install "martino-summarize[server]"   # HTTP API
+pipx install "martino-summarize[all]"      # server + whisper + litellm
+```
+
+### Quick Start (Docker)
+
+```bash
+git clone https://github.com/martinopiaggi/summarize.git
+cd summarize
+cp summarizer.docker.yaml summarizer.yaml   # Docker-optimized defaults
+echo "GROQ_API_KEY=your_key_here" > .env     # or OPENAI_API_KEY, etc.
+docker compose up -d
+```
+
+Open **http://localhost:8501**, paste a URL, and summarize. Summaries and transcript cache persist under `./summaries/`.
+
+Or pull the pre-built image:
+
+```bash
+docker pull ghcr.io/martinopiaggi/summarize:latest
+```
+
+`docker-compose.yml` mounts `.env`, `summarizer.yaml`, and `./summaries/`. Use `docker-compose.gui-only.yml` for a lighter YouTube-only setup, or `docker-compose.named-volume.yml` for a Docker-managed volume. Cobalt runs as a sidecar for TikTok, Instagram, and other yt-dlp fallbacks.
+
+## Pick Your Interface
+
+| Interface | Command |
+|-----------|---------|
+| **Streamlit GUI** | `docker compose up -d` → `http://localhost:8501` |
+| **CLI** | `summarizer --source <source>` |
+| **HTTP API** | `pipx install "martino-summarize[server]"` then `summarizer serve` → `http://localhost:8000/docs` |
+| **Docker** | `docker compose up -d` |
+| **Agent Skill** | [`.agent/skills/summarize/SKILL.md`](https://github.com/martinopiaggi/summarize/blob/main/.agent/skills/summarize/SKILL.md) |
+| **Raycast** | [`extensions/raycast-summarize/`](https://github.com/martinopiaggi/summarize/tree/main/extensions/raycast-summarize) |
+
+See the [HTTP API guide](api-reference/http-api) for endpoint details, request examples, and CORS configuration.
+
+## Two Processing Paths
+
+- **Transcript path** (default): downloads audio/video, transcribes with Whisper or captions, caches the transcript, then summarizes with an LLM.
+- **Visual path** (`--visual`): sends the video directly to a vision-capable model, skipping transcription. Uses the same prompts, provider config, and `.env` keys as the transcript path. Supports `base64` chunks (default) and `url` passthrough for YouTube.
+
+See [How It Works](how-it-works) for the full pipeline diagram and [Visual Mode](features/visual-mode) for provider setup.
+
+## Common Issues
+
+- **pydantic / pydantic-core mismatch on `serve`:** environment problem, not a summarizer bug — reinstall with `pipx install "martino-summarize[server]"` or see [Errors and Troubleshooting](usage/errors-and-troubleshooting)
+- **yt-dlp / platform errors:** ensure Cobalt is running (`docker compose` includes it) or set `COBALT_BASE_URL`
+- **Missing API key:** add the provider key to `.env` (see `summarizer.example.yaml` for provider names)
+- **No config file:** run `summarizer --init-config` or pass `--base-url` and `--model` with `--no-config`
+- **Removed `audio-speed` key:** use `speed` in YAML instead (see [Configuration](getting-started/configuration))
+
+Full guide: [Errors and Troubleshooting](usage/errors-and-troubleshooting)

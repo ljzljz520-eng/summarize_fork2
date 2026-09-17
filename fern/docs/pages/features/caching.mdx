@@ -1,0 +1,75 @@
+# Caching
+
+The summarizer keeps a **transcript cache** so you can re-process the same video with different styles, providers, or languages without waiting for transcription again.
+
+## How It Works
+
+When you run the CLI or webapp:
+
+1. A **cache key** is built from the parameters that affect transcription output
+2. If a matching transcript exists in memory (or on disk when persistence is enabled), it is returned instantly
+3. On a cache miss, the transcript is fetched normally and stored for later reuse
+
+Cache hits are reported in verbose mode:
+
+```
+[+] Transcript cache hit (memory, a3f7b2d8e1c4) — skipping transcription
+[+] Transcript cache hit (disk, a3f7b2d8e1c4) — skipping transcription
+```
+
+## Cache Key
+
+The key is a **SHA-256 hash** of these parameters joined together:
+
+| Parameter | Default |
+|-----------|---------|
+| `source_url_or_path` | — |
+| `language` | `auto` |
+| `transcription_method` | `Cloud Whisper` |
+| `whisper_model` | `tiny` |
+| `speed` | `1.0` |
+| `use_youtube_captions` | `true` |
+
+Changing **any** of these values produces a different key and triggers a fresh transcription. Changing the summary style, provider, or output language does **not** affect the key, so those re-runs are instant.
+
+## In-Memory Cache (Default)
+
+By default, transcripts are cached in **process memory** only. Restarting the CLI or Streamlit server clears the in-memory cache.
+
+## Disk Persistence (Docker / Long-Running Deployments)
+
+Enable on-disk caching so transcripts survive container restarts:
+
+```yaml
+defaults:
+  cache-transcript-persist: true
+  output-dir: summaries
+```
+
+Cached files are stored under `{output-dir}/.cache/transcripts/`.
+
+Or set environment variables (used when the YAML key is omitted):
+
+| Variable | Effect |
+|----------|--------|
+| `SUMMARIZER_CACHE_PERSIST=true` | Enable disk persistence |
+| `SUMMARIZER_CACHE_DIR` | Custom cache directory (optional) |
+
+Docker Compose sets `SUMMARIZER_CACHE_PERSIST=true` by default. The image ships with `cache-transcript-persist: true` in `summarizer.docker.yaml`.
+
+## Disabling the Cache
+
+Set `cache-transcript: false` in `summarizer.yaml`:
+
+```yaml
+defaults:
+  cache-transcript: false
+```
+
+Or pass `--no-config` and the cache is bypassed entirely.
+
+## Important Notes
+
+- In-memory entries are always used first; disk is checked on a miss.
+- The cache does not apply to **visual mode** (`--visual`), which skips transcription entirely.
+- The cache applies to **TXT files** too, since they bypass audio processing and are treated as pre-existing transcripts.

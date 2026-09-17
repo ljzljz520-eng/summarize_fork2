@@ -1,0 +1,423 @@
+"""CLI interface for the summarizer package."""
+
+import argparse
+import os
+import sys
+from typing import List, Optional
+from .core import main, CONFIG
+from .progress import print_status
+from .config_file import (
+    load_config_file,
+    merge_configs,
+    find_config_file,
+    create_example_config,
+)
+from .api_utils import build_runtime_config, format_output, get_file_extension
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Summarize video content from various sources",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Using config file with provider shortcut
+  python -m summarizer --source "URL" --provider groq
+
+  # Generate example config file
+  python -m summarizer --init-config
+
+  # Traditional usage
+  python -m summarizer --source "URL" --base-url "https://api.groq.com/openai/v1" --model "llama-3.3-70b-versatile"
+
+  # Start HTTP API server
+  python -m summarizer serve
+""",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ── Server subcommand ──
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start the HTTP API server",
+        description="Start the FastAPI HTTP server for the summarizer API.",
+    )
+    serve_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Server host (default: 127.0.0.1)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server port (default: 8000)",
+    )
+
+    # ── Summarization arguments (main parser) ──
+    # Config file options
+    parser.add_argument(
+        "--provider",
+        "-p",
+        help="Provider name from config file (e.g., 'groq', 'gemini')",
+    )
+    parser.add_argument("--config", help="Path to config file (default: auto-detect)")
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="Generate example config file and exit",
+    )
+    parser.add_argument(
+        "--no-config", action="store_true", help="Ignore config file, use CLI args only"
+    )
+
+    # Source configuration
+    parser.add_argument(
+        "--source", nargs="+", help="One or more video sources (URLs or filenames)"
+    )
+    parser.add_argument(
+        "--type",
+        choices=[
+            "YouTube Video",
+            "Video URL",
+            "Google Drive Video Link",
+            "Dropbox Video Link",
+            "Local File",
+            "TXT",
+        ],
+        default="YouTube Video",
+        help="Source type",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Force audio download instead of using YouTube captions",
+    )
+
+    # API configuration (optional if using config file)
+    parser.add_argument(
+        "--base-url", help="Base URL for API (e.g., https://api.deepseek.com/v1)"
+    )
+    parser.add_argument("--model", help="Model to use (e.g., deepseek-chat)")
+    parser.add_argument(
+        "--api-key", help="API key. If not provided, will look in .env file"
+    )
+    parser.add_argument(
+        "--cobalt-url",
+        help="Cobalt base URL for non-YouTube platforms (default: http://localhost:9000)",
+    )
+
+    # Output configuration
+    parser.add_argument(
+        "--output-dir",
+        help="Directory to save summaries (default: summaries)",
+    )
+    parser.add_argument(
+        "--output-format",
+        "-f",
+        choices=["markdown", "json", "html"],
+        default="markdown",
+        help="Output format (default: markdown)",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Print to stdout instead of saving to file",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output with detailed progress",
+    )
+
+    # Processing settings
+    # Dynamically load prompt types from prompts.json
+    import json, os as _os
+    _prompts_path = _os.path.join(_os.path.dirname(__file__), "prompts.json")
+    try:
+        with open(_prompts_path, "r", encoding="utf-8") as _f:
+            _prompt_choices = list(json.load(_f).keys())
+    except Exception:
+        _prompt_choices = []
+    parser.add_argument(
+        "--prompt-type",
+        choices=_prompt_choices,
+        default=None,
+        help="Summary style",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        help="Size of text chunks for processing",
+    )
+    parser.add_argument(
+        "--parallel-calls", type=int, help="Number of parallel API calls"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, help="Maximum tokens in model output"
+    )
+    parser.add_argument(
+        "--language",
+        help="Language code for captions/transcription, or 'auto' for automatic selection",
+    )
+    parser.add_argument(
+        "--output-language",
+        help="Language for the generated summary, or 'auto' to leave the prompt unchanged",
+    )
+    parser.add_argument(
+        "--transcription",
+        choices=["Cloud Whisper", "Local Whisper"],
+        help="Transcription method when forcing download",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        choices=["tiny", "base", "small", "medium", "large"],
+        help="Whisper model size for local transcription (default: tiny for speed)",
+    )
+    parser.add_argument(
+        "--speed",
+        dest="speed",
+        type=float,
+        help="Playback speed for preprocessing before transcription or visual-mode video (any positive value)",
+    )
+    parser.add_argument(
+        "--use-proxy",
+        dest="use_proxy",
+        action="store_true",
+        default=None,
+        help="Route supported requests through the configured HTTP proxy",
+    )
+    parser.add_argument(
+        "--visual",
+        action="store_true",
+        default=None,
+        help=(
+            "Send video directly to a video-capable model instead of transcribing "
+            "audio. Providers with short video limits use temporal video chunks."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def process_url(
+    url: str,
+    base_config: dict,
+    output_dir: str,
+    verbose: bool,
+    output_format: str = "markdown",
+    no_save: bool = False,
+) -> bool:
+    """Process a single URL."""
+    if verbose:
+        print_status(f"Starting processing for: {url}", "PROCESSING", verbose)
+
+    config = base_config.copy()
+    config["source_url_or_path"] = url
+    config["verbose"] = verbose
+
+    try:
+        summary = main(config)
+
+        # Format output
+        metadata = {
+            "prompt_type": config.get("prompt_type", ""),
+            "model": config.get("model", ""),
+        }
+        formatted = format_output(summary, url, output_format, metadata)
+
+        if no_save:
+            print(formatted)
+            return True
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Generate filename
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        clean_url = url.split("?")[0].split("/")[-1]
+        ext = get_file_extension(output_format)
+        filename = f"{clean_url}_{timestamp}{ext}"
+        filepath = os.path.join(output_dir, filename)
+
+        # Save
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(formatted)
+
+        if verbose:
+            print_status(f"Summary saved to: {filepath}", "SUCCESS", verbose)
+        else:
+            print_status(f"Saved {filename}", "SUCCESS", verbose)
+
+        return True
+
+    except Exception as e:
+        print_status(f"Error: {str(e)}", "ERROR", verbose)
+        return False
+
+
+def cli():
+    """Entry point for the CLI."""
+    args = parse_args()
+    verbose = args.verbose
+
+    # Handle server subcommand
+    if args.command == "serve":
+        try:
+            import uvicorn
+        except ImportError:
+            print(
+                "Server dependencies not installed. Run: pip install 'summarizer[server]'"
+            )
+            sys.exit(1)
+        print(f"Starting Summarize API server at http://{args.host}:{args.port}")
+        print(f"API docs: http://{args.host}:{args.port}/docs")
+        uvicorn.run("summarizer.server:app", host=args.host, port=args.port, reload=False)
+        return
+
+    # Handle --init-config
+    if args.init_config:
+        config_path = os.path.join(os.getcwd(), "summarizer.yaml")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(create_example_config())
+        print(f"Created example config: {config_path}")
+        return
+
+    # Load config file
+    file_config = {}
+    if not args.no_config:
+        config_path = args.config if args.config else None
+        file_config = load_config_file(config_path if config_path else None)
+
+        if file_config and verbose:
+            found_path = find_config_file()
+            print_status(f"Loaded config from: {found_path}", "INFO", verbose)
+
+    # Build CLI args dict
+    cli_args = {
+        "provider": args.provider,
+        "base_url": args.base_url,
+        "model": args.model,
+        "api_key": args.api_key,
+        "prompt_type": args.prompt_type,
+        "chunk_size": args.chunk_size,
+        "parallel_api_calls": args.parallel_calls,
+        "max_output_tokens": args.max_tokens,
+        "language": args.language,
+        "output_language": args.output_language,
+        "transcription_method": args.transcription,
+        "whisper_model": args.whisper_model,
+        "speed": args.speed,
+        "output_dir": args.output_dir,
+        "cobalt_base_url": args.cobalt_url,
+        "use_proxy": args.use_proxy,
+        "visual": args.visual,
+    }
+
+    # Merge configs
+    merged = merge_configs(file_config, cli_args)
+
+    # Validate required fields
+    if not merged.get("base_url") or not merged.get("model"):
+        if args.provider:
+            print_status(
+                f"Provider '{args.provider}' not found in config file", "ERROR", True
+            )
+        else:
+            print_status(
+                "--base-url and --model are required (or use --provider with config file)",
+                "ERROR",
+                True,
+            )
+        sys.exit(1)
+
+    if not args.source:
+        print_status("--source is required", "ERROR", True)
+        sys.exit(1)
+
+    try:
+        speed = float(merged.get("speed", 1.0))
+    except (TypeError, ValueError):
+        print_status("--speed must be a positive number", "ERROR", True)
+        sys.exit(1)
+    if speed <= 0:
+        print_status("--speed must be greater than 0", "ERROR", True)
+        sys.exit(1)
+
+    if verbose:
+        print_status("Video Summarizer CLI Started", "PROCESSING", verbose)
+        print_status(f"Output directory: {merged.get('output_dir')}", "INFO", verbose)
+        print_status(f"Model: {merged.get('model')}", "INFO", verbose)
+        print_status(f"Prompt type: {merged.get('prompt_type')}", "INFO", verbose)
+        print_status(
+            f"Output language: {merged.get('output_language', 'auto')}",
+            "INFO",
+            verbose,
+        )
+        print_status(f"Output format: {args.output_format}", "INFO", verbose)
+        print_status(f"Speed: {speed}x", "INFO", verbose)
+
+    # Smart caption logic
+    transcription_was_provided = any("--transcription" in arg for arg in sys.argv)
+    explicit_transcription = transcription_was_provided and args.transcription in [
+        "Cloud Whisper",
+        "Local Whisper",
+    ]
+    smart_force_download = args.force_download or explicit_transcription
+
+    if verbose and explicit_transcription and not args.force_download:
+        print_status(
+            f"Auto-enabling audio download for {args.transcription} testing",
+            "INFO",
+            verbose,
+        )
+
+    # Build shared runtime config (source will be set per-URL in process_url)
+    base_config = build_runtime_config(
+        merged=merged,
+        source="",  # placeholder; overridden per-URL in process_url
+        type_of_source=args.type,
+        verbose=verbose,
+        force_download=smart_force_download,
+    )
+
+    # Process each URL
+    success_count = 0
+    for i, source in enumerate(args.source, 1):
+        if verbose:
+            print_status(
+                f"[{i}/{len(args.source)}] Processing source", "PROCESSING", verbose
+            )
+        if process_url(
+            source,
+            base_config,
+            merged.get("output_dir", "summaries"),
+            verbose,
+            args.output_format,
+            args.no_save,
+        ):
+            success_count += 1
+
+    # Final summary
+    if success_count == len(args.source):
+        if verbose:
+            print_status(
+                f"All {len(args.source)} sources processed successfully!",
+                "SUCCESS",
+                verbose,
+            )
+        else:
+            print_status(
+                f"Completed all {len(args.source)} sources", "SUCCESS", verbose
+            )
+    else:
+        print_status(
+            f"Completed {success_count}/{len(args.source)} sources", "WARNING", verbose
+        )
+
+
+if __name__ == "__main__":
+    cli()
