@@ -37,6 +37,20 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_job_system(tmp_path, monkeypatch):
+    """Point the persistent job system at a throwaway dir and fail jobs on the
+    first stage error (no real network retries during tests)."""
+    monkeypatch.setenv("SUMMARIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SUMMARIZER_JOB_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("SUMMARIZER_SYNC_WAIT_TIMEOUT", "30")
+    from summarizer.jobs.runner import reset_runner
+
+    runner = reset_runner()
+    yield
+    runner.shutdown()
+
+
 # ── Health ──
 
 class TestHealthEndpoint:
@@ -119,7 +133,7 @@ class TestConfigEndpoint:
 # ── Summarize ──
 
 class TestSummarizeEndpoint:
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_url_success(self, mock_load, mock_merge, mock_main, client):
@@ -161,7 +175,7 @@ class TestSummarizeEndpoint:
         assert data["format"] == "markdown"
         assert data["processing_time_seconds"] >= 0
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_json_format(self, mock_load, mock_merge, mock_main, client):
@@ -199,7 +213,7 @@ class TestSummarizeEndpoint:
         summary_json = json.loads(data["summary"])
         assert summary_json["summary"] == "JSON test summary."
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_html_format(self, mock_load, mock_merge, mock_main, client):
@@ -236,7 +250,7 @@ class TestSummarizeEndpoint:
         assert data["format"] == "html"
         assert "<!DOCTYPE html>" in data["summary"]
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_with_all_options(self, mock_load, mock_merge, mock_main, client):
@@ -312,7 +326,7 @@ class TestSummarizeEndpoint:
         assert config["cobalt_base_url"] == "http://localhost:9000"
         assert config["verbose"] is True
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_error_handling(self, mock_load, mock_merge, mock_main, client):
@@ -347,7 +361,7 @@ class TestSummarizeEndpoint:
         assert data["error_type"] == "TranscriptError"
         assert "No captions available" in data["error"]
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_summarize_unexpected_error(self, mock_load, mock_merge, mock_main, client):
@@ -437,7 +451,7 @@ class TestValidation:
 # ── Upload ──
 
 class TestSummarizeUploadEndpoint:
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_upload_video_file(self, mock_load, mock_merge, mock_main, client):
@@ -477,7 +491,7 @@ class TestSummarizeUploadEndpoint:
         config = mock_main.call_args[0][0]
         assert config["type_of_source"] == "Local File"
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_upload_text_file(self, mock_load, mock_merge, mock_main, client):
@@ -516,7 +530,7 @@ class TestSummarizeUploadEndpoint:
         config = mock_main.call_args[0][0]
         assert config["type_of_source"] == "TXT"
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_upload_with_explicit_type(self, mock_load, mock_merge, mock_main, client):
@@ -552,7 +566,7 @@ class TestSummarizeUploadEndpoint:
         config = mock_main.call_args[0][0]
         assert config["type_of_source"] == "Local File"
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_upload_error_handling(self, mock_load, mock_merge, mock_main, client):
@@ -594,7 +608,7 @@ class TestSummarizeUploadEndpoint:
 # ── Batch ──
 
 class TestBatchEndpoint:
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_batch_all_success(self, mock_load, mock_merge, mock_main, client):
@@ -641,7 +655,7 @@ class TestBatchEndpoint:
             assert "Batch summary" in result["summary"]
         assert data["overall_processing_time_seconds"] >= 0
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_batch_forwards_speed_field(self, mock_load, mock_merge, mock_main, client):
@@ -677,7 +691,7 @@ class TestBatchEndpoint:
         assert config["speed"] == 2.5
         assert config["speed"] == 2.5
 
-    @patch("summarizer.server.main")
+    @patch("summarizer.jobs.executor.execute_job")
     @patch("summarizer.server.merge_configs")
     @patch("summarizer.server.load_config_file")
     def test_batch_partial_failure(self, mock_load, mock_merge, mock_main, client):
@@ -703,7 +717,7 @@ class TestBatchEndpoint:
             "visual_chunk_overlap_seconds": 0,
         }
 
-        def side_effect(config):
+        def side_effect(config, ctx):
             if "VIDEO1" in config.get("source_url_or_path", ""):
                 return "Summary for video 1"
             raise TranscriptError("No captions for video 2")

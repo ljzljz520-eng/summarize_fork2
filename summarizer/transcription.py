@@ -247,15 +247,26 @@ def get_transcript(config: dict) -> str:
     return transcript
 
 
-def _fetch_transcript(config: dict) -> str:
-    """Fetch transcript from the source (no cache)."""
+def acquire_transcript_source(config: dict):
+    """Acquire the raw input needed for transcription ("acquiring" stage).
+
+    This is the acquisition half of :func:`_fetch_transcript`: it downloads /
+    opens / fetches the source but never runs a transcription model.
+
+    Returns a tuple ``(kind, payload)`` where:
+
+    * ``("text", text)``        - the transcript text is already available
+                                  (a TXT file or YouTube captions);
+    * ``("audio", (path, should_delete))`` - a local audio file that still
+                                  needs to go through :func:`transcribe_audio`.
+
+    Splitting acquisition from transcription gives the persistent job
+    pipeline a checkpoint boundary between the two stages.
+    """
     source_type = config.get("type_of_source")
     source_path = config.get("source_url_or_path")
-    transcription_method = config.get("transcription_method", "Cloud Whisper")
-    whisper_model = config.get("whisper_model", "tiny")
     verbose = config.get("verbose", False)
     use_proxy = bool(config.get("use_proxy", False))
-    language = config.get("language", "auto")
 
     if not source_type or not source_path:
         raise TranscriptError("Source type and path/URL are required")
@@ -271,7 +282,7 @@ def _fetch_transcript(config: dict) -> str:
                 text = f.read()
         if not text or not text.strip():
             raise TranscriptError("Text file is empty")
-        return text
+        return "text", text
 
     try:
         speed = float(config.get("speed", 1.0))
@@ -280,6 +291,8 @@ def _fetch_transcript(config: dict) -> str:
     if speed <= 0:
         raise TranscriptError("speed must be greater than 0")
 
+    language = config.get("language", "auto")
+
     if is_dropbox_url(source_path):
         handler = get_handler(
             "Dropbox Video Link",
@@ -287,18 +300,7 @@ def _fetch_transcript(config: dict) -> str:
             audio_speed=speed,
             use_proxy=use_proxy,
         )
-        audio_path, should_delete = handler.get_processed_audio()
-        try:
-            return transcribe_audio(
-                audio_path,
-                transcription_method,
-                verbose,
-                whisper_model,
-                language,
-            )
-        finally:
-            if should_delete and os.path.exists(audio_path):
-                os.remove(audio_path)
+        return "audio", handler.get_processed_audio()
 
     if is_google_drive_url(source_path):
         handler = get_handler(
@@ -307,18 +309,7 @@ def _fetch_transcript(config: dict) -> str:
             audio_speed=speed,
             use_proxy=use_proxy,
         )
-        audio_path, should_delete = handler.get_processed_audio()
-        try:
-            return transcribe_audio(
-                audio_path,
-                transcription_method,
-                verbose,
-                whisper_model,
-                language,
-            )
-        finally:
-            if should_delete and os.path.exists(audio_path):
-                os.remove(audio_path)
+        return "audio", handler.get_processed_audio()
 
     if source_type == "YouTube Video":
         if is_youtube_url(source_path) and config.get("use_youtube_captions", True):
@@ -338,7 +329,7 @@ def _fetch_transcript(config: dict) -> str:
                 if use_proxy:
                     print_status("Proxy enabled for caption fetch", "INFO", verbose)
                 try:
-                    return get_youtube_transcript(
+                    return "text", get_youtube_transcript(
                         video_id,
                         language,
                         verbose,
@@ -358,17 +349,7 @@ def _fetch_transcript(config: dict) -> str:
             audio_speed=speed,
             use_proxy=use_proxy,
         )
-        try:
-            return transcribe_audio(
-                audio_path,
-                transcription_method,
-                verbose,
-                whisper_model,
-                language,
-            )
-        finally:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
+        return "audio", (audio_path, True)
 
     if source_type in ("Local File", "Google Drive Video Link", "Dropbox Video Link"):
         handler = get_handler(
@@ -377,18 +358,7 @@ def _fetch_transcript(config: dict) -> str:
             audio_speed=speed,
             use_proxy=use_proxy,
         )
-        audio_path, should_delete = handler.get_processed_audio()
-        try:
-            return transcribe_audio(
-                audio_path,
-                transcription_method,
-                verbose,
-                whisper_model,
-                language,
-            )
-        finally:
-            if should_delete and os.path.exists(audio_path):
-                os.remove(audio_path)
+        return "audio", handler.get_processed_audio()
 
     if source_type == "Video URL":
         if use_proxy:
@@ -399,16 +369,31 @@ def _fetch_transcript(config: dict) -> str:
             audio_speed=speed,
             use_proxy=use_proxy,
         )
-        try:
-            return transcribe_audio(
-                audio_path,
-                transcription_method,
-                verbose,
-                whisper_model,
-                language,
-            )
-        finally:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
+        return "audio", (audio_path, True)
 
     raise TranscriptError(f"Unknown source type: {source_type}")
+
+
+def _fetch_transcript(config: dict) -> str:
+    """Fetch transcript from the source (no cache)."""
+    transcription_method = config.get("transcription_method", "Cloud Whisper")
+    whisper_model = config.get("whisper_model", "tiny")
+    verbose = config.get("verbose", False)
+    language = config.get("language", "auto")
+
+    kind, payload = acquire_transcript_source(config)
+    if kind == "text":
+        return payload
+
+    audio_path, should_delete = payload
+    try:
+        return transcribe_audio(
+            audio_path,
+            transcription_method,
+            verbose,
+            whisper_model,
+            language,
+        )
+    finally:
+        if should_delete and os.path.exists(audio_path):
+            os.remove(audio_path)

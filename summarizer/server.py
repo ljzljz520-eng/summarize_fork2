@@ -3,15 +3,18 @@
 Exposes all CLI functionality via a REST API. Auto-generated docs at /docs.
 """
 
+import asyncio
+import json
 import os
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 try:
     from pydantic import BaseModel, Field, model_validator
 
@@ -25,8 +28,11 @@ except ImportError:
         return root_validator(pre=True)(func)
 
 from summarizer.config_file import load_config_file, merge_configs, find_config_file
-from summarizer.core import main
 from summarizer.exceptions import SummarizerError, ConfigurationError
+from summarizer.jobs import JobKind, JobState
+from summarizer.jobs.runner import get_runner
+from summarizer.jobs.states import is_terminal
+from summarizer.jobs.store import new_job_id
 from summarizer.prompts import get_available_prompts
 from summarizer.api_utils import (
     build_runtime_config,
@@ -38,6 +44,9 @@ from summarizer.api_utils import (
     DEFAULT_MAX_UPLOAD_MB,
     redact_config_response,
 )
+
+# Default wait budget for the legacy synchronous compatibility endpoints.
+SYNC_WAIT_TIMEOUT = float(os.environ.get("SUMMARIZER_SYNC_WAIT_TIMEOUT", "3600"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,6 +97,9 @@ class SummarizeRequest(BaseModel):
     model: Optional[str] = Field(None, description="Override model name")
     cobalt_url: Optional[str] = Field(None, description="Cobalt base URL")
     verbose: bool = Field(False, description="Verbose progress output")
+    idempotency_key: Optional[str] = Field(
+        None, description="Client-generated idempotency key (or send Idempotency-Key header)"
+    )
 
     @_before_model_validator
     def _reject_legacy_audio_speed(cls, data: Any) -> Any:
@@ -138,10 +150,29 @@ class BatchRequest(BaseModel):
     model: Optional[str] = Field(None, description="Override model name")
     cobalt_url: Optional[str] = Field(None, description="Cobalt base URL")
     verbose: bool = Field(False, description="Verbose progress output")
+    idempotency_key: Optional[str] = Field(
+        None, description="Client-generated idempotency key for the whole batch"
+    )
 
     @_before_model_validator
     def _reject_legacy_audio_speed(cls, data: Any) -> Any:
         return _reject_legacy_audio_speed_field(data)
+
+
+class JobChildRef(BaseModel):
+    job_id: str
+    source: str
+    dep_index: int
+
+
+class JobEnqueueResponse(BaseModel):
+    job_id: str
+    state: str
+    kind: str
+    idempotency_key: Optional[str] = None
+    idempotent_hit: bool = False
+    created_at: float
+    children: Optional[List[JobChildRef]] = None
 
 
 class BatchResult(BaseModel):
@@ -262,6 +293,215 @@ def _error_response(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Job-system helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _resolve_idempotency_key(req: Any, request: Optional[Request] = None) -> Optional[str]:
+    key = getattr(req, "idempotency_key", None)
+    if key:
+        return key
+    if request is not None:
+        header_key = request.headers.get("Idempotency-Key")
+        if header_key:
+            return header_key.strip()
+    return None
+
+
+def _single_request_for(source: str, req: BatchRequest) -> SummarizeRequest:
+    """Instantiate the per-item request for a batch entry."""
+    return SummarizeRequest(
+        source=source,
+        type=req.type,
+        provider=req.provider,
+        prompt_type=req.prompt_type,
+        chunk_size=req.chunk_size,
+        parallel_calls=req.parallel_calls,
+        max_tokens=req.max_tokens,
+        language=req.language,
+        output_language=req.output_language,
+        force_download=req.force_download,
+        transcription=req.transcription,
+        whisper_model=req.whisper_model,
+        speed=req.speed,
+        output_format=req.output_format,
+        visual=req.visual,
+        use_proxy=req.use_proxy,
+        api_key=req.api_key,
+        base_url=req.base_url,
+        model=req.model,
+        cobalt_url=req.cobalt_url,
+        verbose=req.verbose,
+    )
+
+
+async def _submit_and_wait_single(
+    config: Dict[str, Any],
+    *,
+    display_source: str,
+    output_format: str,
+    idempotency_key: Optional[str],
+    job_id: Optional[str] = None,
+) -> SummarizeResponse:
+    """Legacy synchronous adapter: enqueue one job and block for completion."""
+    runner = get_runner()
+    row, _hit = runner.submit_single(
+        config,
+        source=config.get("source_url_or_path", display_source),
+        output_format=output_format,
+        idempotency_key=idempotency_key,
+        job_id=job_id,
+    )
+    try:
+        final = await runner.wait_for_terminal(row["job_id"], timeout=SYNC_WAIT_TIMEOUT)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={"job_id": row["job_id"], "error": str(exc)},
+        )
+
+    started = final.get("started_at") or final["created_at"]
+    finished = final.get("finished_at") or time.time()
+    elapsed = max(0.0, finished - started)
+
+    if final["state"] == JobState.COMPLETED.value and final.get("result_ref"):
+        raw = runner.store.read_artifact_text(final["result_ref"])
+        formatted = format_output(
+            raw,
+            display_source,
+            output_format,
+            {"prompt_type": config.get("prompt_type", ""), "model": config.get("model", "")},
+        )
+        return SummarizeResponse(
+            success=True,
+            source=display_source,
+            summary=formatted,
+            format=output_format,
+            model=config.get("model"),
+            prompt_type=config.get("prompt_type"),
+            processing_time_seconds=round(elapsed, 2),
+        )
+
+    if final["state"] == JobState.CANCELLED.value:
+        return SummarizeResponse(
+            success=False, source=display_source, summary="", format=output_format,
+            error="Job cancelled", error_type="JobCancelled",
+            processing_time_seconds=round(elapsed, 2),
+        )
+
+    return SummarizeResponse(
+        success=False,
+        source=display_source,
+        summary="",
+        format=output_format,
+        error=final.get("error") or "Job failed",
+        error_type=final.get("error_type") or "Unknown",
+        processing_time_seconds=round(elapsed, 2),
+    )
+
+
+async def _submit_and_wait_batch(
+    req: BatchRequest,
+    idempotency_key: Optional[str],
+) -> BatchResponse:
+    """Legacy synchronous adapter for /summarize/batch."""
+    runner = get_runner()
+    items = []
+    configs = []
+    for source in req.sources:
+        single_req = _single_request_for(source, req)
+        config = _build_runtime_config_from_request(single_req)
+        configs.append(config)
+        items.append({"source": source, "config": config,
+                      "output_format": req.output_format})
+
+    parent, _children, _hit = runner.submit_batch(
+        items,
+        parent_config=configs[0],
+        output_format=req.output_format,
+        idempotency_key=idempotency_key,
+    )
+    try:
+        final = await runner.wait_for_terminal(parent["job_id"], timeout=SYNC_WAIT_TIMEOUT)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={"job_id": parent["job_id"], "error": str(exc)},
+        )
+
+    view = runner.view(final["job_id"])
+    aggregate = (view or {}).get("batch")
+    if final["state"] != JobState.COMPLETED.value or aggregate is None:
+        # Cancellation / unexpected failure: synthesize the legacy shape.
+        results = [
+            BatchResult(
+                source=source,
+                success=False,
+                error="Batch job cancelled" if final["state"] == JobState.CANCELLED.value
+                else (final.get("error") or "Batch job failed"),
+                error_type="JobCancelled" if final["state"] == JobState.CANCELLED.value
+                else (final.get("error_type") or "Unknown"),
+                processing_time_seconds=0.0,
+            )
+            for source in req.sources
+        ]
+        return BatchResponse(
+            success_count=0,
+            total_count=len(req.sources),
+            results=results,
+            overall_processing_time_seconds=round(
+                time.time() - (final.get("started_at") or final["created_at"]), 2
+            ),
+        )
+
+    return BatchResponse(
+        success_count=aggregate["success_count"],
+        total_count=aggregate["total_count"],
+        results=[BatchResult(**{
+            k: v for k, v in item.items() if k in {
+                "source", "success", "summary", "error",
+                "error_type", "processing_time_seconds",
+            }
+        }) for item in aggregate["results"]],
+        overall_processing_time_seconds=aggregate["overall_processing_time_seconds"],
+    )
+
+
+async def _job_event_stream(
+    job_id: str,
+    last_event_id: int = 0,
+    heartbeat_seconds: float = 15.0,
+):
+    """SSE generator: durable event-log replay + live bus wakeups."""
+    runner = get_runner()
+    if runner.get_job(job_id) is None:
+        yield f"event: error\ndata: {json.dumps({'error': 'job not found'})}\n\n"
+        return
+
+    subscription = runner.bus.subscribe(job_id)
+    seq = int(last_event_id or 0)
+    try:
+        while True:
+            events = await run_in_threadpool(runner.events_since, job_id, seq)
+            for event in events:
+                seq = int(event["seq"])
+                payload = {"event": event["event"], **(event.get("payload") or {})}
+                yield (
+                    f"id: {seq}\n"
+                    f"event: {event['event']}\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+                )
+            row = runner.get_job(job_id)
+            if row is not None and is_terminal(row["state"]):
+                return
+            try:
+                await asyncio.wait_for(subscription._queue.get(), timeout=heartbeat_seconds)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+    finally:
+        subscription.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app factory
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -336,41 +576,136 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
             config_file_path=config_path.as_posix() if config_path else None,
         )
 
-    @application.post("/summarize", response_model=SummarizeResponse)
-    async def summarize(req: SummarizeRequest) -> SummarizeResponse:
-        """Summarize a video from a URL or file path."""
-        start_time = time.time()
+    # ── Asynchronous job API ──────────────────────────────────────────────
 
+    @application.post("/jobs", response_model=JobEnqueueResponse, status_code=202)
+    async def enqueue_job(request: Request, req: SummarizeRequest) -> JobEnqueueResponse:
+        """Quickly enqueue a single summarization job and return its job_id."""
+        config = _build_runtime_config_from_request(req)
+        runner = get_runner()
+        row, hit = runner.submit_single(
+            config,
+            output_format=req.output_format,
+            idempotency_key=_resolve_idempotency_key(req, request),
+        )
+        return JobEnqueueResponse(
+            job_id=row["job_id"],
+            state=row["state"],
+            kind=row["kind"],
+            idempotency_key=row.get("idempotency_key"),
+            idempotent_hit=hit,
+            created_at=row["created_at"],
+        )
+
+    @application.post("/jobs/batch", response_model=JobEnqueueResponse, status_code=202)
+    async def enqueue_batch(request: Request, req: BatchRequest) -> JobEnqueueResponse:
+        """Enqueue a batch: one parent job plus one child job per source."""
+        runner = get_runner()
+        items = []
+        configs = []
+        for source in req.sources:
+            single_req = _single_request_for(source, req)
+            config = _build_runtime_config_from_request(single_req)
+            configs.append(config)
+            items.append({"source": source, "config": config,
+                          "output_format": req.output_format})
+        parent, children, hit = runner.submit_batch(
+            items,
+            parent_config=configs[0],
+            output_format=req.output_format,
+            idempotency_key=_resolve_idempotency_key(req, request),
+        )
+        return JobEnqueueResponse(
+            job_id=parent["job_id"],
+            state=parent["state"],
+            kind=parent["kind"],
+            idempotency_key=parent.get("idempotency_key"),
+            idempotent_hit=hit,
+            created_at=parent["created_at"],
+            children=[
+                JobChildRef(job_id=c["job_id"], source=c["source"], dep_index=c["dep_index"])
+                for c in children
+            ],
+        )
+
+    @application.get("/jobs")
+    async def list_jobs(limit: int = 50) -> List[Dict[str, Any]]:
+        """List recent top-level jobs (newest first)."""
+        limit = max(1, min(int(limit), 500))
+        return get_runner().list_jobs(limit=limit)
+
+    @application.get("/jobs/{job_id}")
+    async def get_job(job_id: str) -> Dict[str, Any]:
+        """Get the full state, progress, snapshot pointer and result of a job."""
+        view = get_runner().view(job_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+        return view
+
+    @application.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> Dict[str, Any]:
+        """Cancel a job. For batches, cancels every live child as well."""
+        runner = get_runner()
+        if runner.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+        return runner.cancel(job_id)
+
+    @application.get("/jobs/{job_id}/events")
+    async def job_events(
+        job_id: str,
+        request: Request,
+        last_event_id: Optional[int] = None,
+    ) -> StreamingResponse:
+        """Server-Sent Events stream for a job (supports Last-Event-ID resume).
+
+        Batch parents also receive ``child`` events for each subtask.
+        """
+        runner = get_runner()
+        if runner.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+        resume = last_event_id
+        if resume is None:
+            header = request.headers.get("Last-Event-ID")
+            if header and header.isdigit():
+                resume = int(header)
+        return StreamingResponse(
+            _job_event_stream(job_id, last_event_id=resume or 0),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ── Legacy synchronous compatibility endpoints ────────────────────────
+
+    @application.post("/summarize", response_model=SummarizeResponse)
+    async def summarize(request: Request, req: SummarizeRequest) -> SummarizeResponse:
+        """Summarize a video from a URL or file path.
+
+        Compatibility adapter: enqueues a persistent job and waits for its
+        completion. Prefer ``POST /jobs`` + ``GET /jobs/{id}/events`` for
+        long-running work.
+        """
         try:
             config = _build_runtime_config_from_request(req)
-            summary = await run_in_threadpool(main, config)
-            formatted = format_output(
-                summary,
-                req.source,
-                req.output_format,
-                {"prompt_type": config.get("prompt_type", ""), "model": config.get("model", "")},
+            return await _submit_and_wait_single(
+                config,
+                display_source=req.source,
+                output_format=req.output_format,
+                idempotency_key=_resolve_idempotency_key(req, request),
             )
-            elapsed = time.time() - start_time
-
-            return SummarizeResponse(
-                success=True,
-                source=req.source,
-                summary=formatted,
-                format=req.output_format,
-                model=config.get("model"),
-                prompt_type=config.get("prompt_type"),
-                processing_time_seconds=round(elapsed, 2),
-            )
-
+        except HTTPException:
+            raise
         except SummarizerError as e:
-            elapsed = time.time() - start_time
-            return _error_response(req.source, req.output_format, elapsed, e)
+            return _error_response(req.source, req.output_format, 0.0, e)
         except Exception as e:
-            elapsed = time.time() - start_time
-            return _error_response(req.source, req.output_format, elapsed, e)
+            return _error_response(req.source, req.output_format, 0.0, e)
 
     @application.post("/summarize/upload", response_model=SummarizeResponse)
     async def summarize_upload(
+        request: Request,
         file: UploadFile = File(..., description="Video or text file to summarize"),
         type: Optional[str] = Form(None, description="Source type (auto-detected if omitted)"),
         provider: Optional[str] = Form(None),
@@ -392,17 +727,14 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
         model: Optional[str] = Form(None),
         cobalt_url: Optional[str] = Form(None),
         verbose: bool = Form(False),
+        idempotency_key: Optional[str] = Form(None),
     ) -> SummarizeResponse:
-        """Summarize an uploaded file.
+        """Summarize an uploaded file (compatibility adapter, blocks on job).
 
         Accepts video files (.mp4, .mp3, .wav, .m4a, .webm) or text files
         (.txt, .md, .vtt, .srt, .csv, .log, .rst, .html, .xml, .json).
         Text files bypass audio processing entirely.
         """
-        start_time = time.time()
-        tmp_path: Optional[str] = None
-
-        # Determine source type from extension if not provided
         filename = file.filename or "upload"
         ext = Path(filename).suffix.lower()
         text_extensions = {
@@ -410,9 +742,9 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
             ".log", ".rst", ".html", ".xml", ".json",
         }
         detected_type = type or ("TXT" if ext in text_extensions else "Local File")
+        tmp_path: Optional[str] = None
 
         try:
-            # Stream upload to temp file in chunks to avoid loading large files into memory
             max_upload_bytes = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
             suffix = ext or ".bin"
             total_read = 0
@@ -432,7 +764,6 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
                     tmp.write(chunk)
                 tmp_path = tmp.name
 
-            # Build request and config
             req = SummarizeRequest(
                 source=tmp_path,
                 type=detected_type,  # type: ignore[arg-type]
@@ -455,35 +786,35 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
                 model=model,
                 cobalt_url=cobalt_url,
                 verbose=verbose,
+                idempotency_key=idempotency_key
+                or request.headers.get("Idempotency-Key"),
             )
-            config = _build_runtime_config_from_request(req, source_override=tmp_path, type_override=detected_type)
-            summary = await run_in_threadpool(main, config)
-            formatted = format_output(
-                summary,
-                filename,
-                output_format,
-                {"prompt_type": config.get("prompt_type", ""), "model": config.get("model", "")},
+            config = _build_runtime_config_from_request(
+                req, source_override=tmp_path, type_override=detected_type
             )
-            elapsed = time.time() - start_time
 
-            return SummarizeResponse(
-                success=True,
-                source=filename,
-                summary=formatted,
-                format=output_format,
-                model=config.get("model"),
-                prompt_type=config.get("prompt_type"),
-                processing_time_seconds=round(elapsed, 2),
+            # Move the upload into the job workspace before enqueueing so an
+            # independent worker process can read it.
+            runner = get_runner()
+            job_id = new_job_id()
+            with open(tmp_path, "rb") as src:
+                workspace_path = runner.persist_upload(job_id, filename, src.read())
+            config["source_url_or_path"] = workspace_path
+
+            return await _submit_and_wait_single(
+                config,
+                display_source=filename,
+                output_format=output_format,
+                idempotency_key=_resolve_idempotency_key(req, request),
+                job_id=job_id,
             )
 
         except HTTPException:
             raise
         except SummarizerError as e:
-            elapsed = time.time() - start_time
-            return _error_response(filename, output_format, elapsed, e)
+            return _error_response(filename, output_format, 0.0, e)
         except Exception as e:
-            elapsed = time.time() - start_time
-            return _error_response(filename, output_format, elapsed, e)
+            return _error_response(filename, output_format, 0.0, e)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -492,84 +823,31 @@ def create_app(allow_origins: Optional[List[str]] = None) -> FastAPI:
                     pass
 
     @application.post("/summarize/batch", response_model=BatchResponse)
-    async def summarize_batch(req: BatchRequest) -> BatchResponse:
-        """Summarize multiple sources in one request.
+    async def summarize_batch(request: Request, req: BatchRequest) -> BatchResponse:
+        """Summarize multiple sources in one request (blocks until all finish).
 
-        Each source is processed sequentially. Results are returned in the same
-        order as the input sources list.
+        Compatibility adapter backed by a batch parent + child jobs. Results
+        are returned in the same order as the input sources list.
         """
-        overall_start = time.time()
-        results: List[BatchResult] = []
-
-        for source in req.sources:
-            item_start = time.time()
-            try:
-                single_req = SummarizeRequest(
-                    source=source,
-                    type=req.type,
-                    provider=req.provider,
-                    prompt_type=req.prompt_type,
-                    chunk_size=req.chunk_size,
-                    parallel_calls=req.parallel_calls,
-                    max_tokens=req.max_tokens,
-                    language=req.language,
-                    output_language=req.output_language,
-                    force_download=req.force_download,
-                    transcription=req.transcription,
-                    whisper_model=req.whisper_model,
-                    speed=req.speed,
-                    output_format=req.output_format,
-                    visual=req.visual,
-                    use_proxy=req.use_proxy,
-                    api_key=req.api_key,
-                    base_url=req.base_url,
-                    model=req.model,
-                    cobalt_url=req.cobalt_url,
-                    verbose=req.verbose,
-                )
-                config = _build_runtime_config_from_request(single_req)
-                summary = await run_in_threadpool(main, config)
-                formatted = format_output(
-                    summary,
-                    source,
-                    req.output_format,
-                    {"prompt_type": config.get("prompt_type", ""), "model": config.get("model", "")},
-                )
-                elapsed = time.time() - item_start
-                results.append(BatchResult(
-                    source=source,
-                    success=True,
-                    summary=formatted,
-                    processing_time_seconds=round(elapsed, 2),
-                ))
-            except SummarizerError as e:
-                elapsed = time.time() - item_start
-                results.append(BatchResult(
-                    source=source,
-                    success=False,
-                    error=str(e),
-                    error_type=e.__class__.__name__,
-                    processing_time_seconds=round(elapsed, 2),
-                ))
-            except Exception as e:
-                elapsed = time.time() - item_start
-                results.append(BatchResult(
-                    source=source,
-                    success=False,
-                    error=f"Unexpected error: {str(e)}",
-                    error_type=e.__class__.__name__,
-                    processing_time_seconds=round(elapsed, 2),
-                ))
-
-        success_count = sum(1 for r in results if r.success)
-        overall_elapsed = time.time() - overall_start
-
-        return BatchResponse(
-            success_count=success_count,
-            total_count=len(req.sources),
-            results=results,
-            overall_processing_time_seconds=round(overall_elapsed, 2),
-        )
+        try:
+            return await _submit_and_wait_batch(
+                req, idempotency_key=_resolve_idempotency_key(req, request)
+            )
+        except HTTPException:
+            raise
+        except SummarizerError as e:
+            return BatchResponse(
+                success_count=0,
+                total_count=len(req.sources),
+                results=[
+                    BatchResult(
+                        source=source, success=False, error=str(e),
+                        error_type=e.__class__.__name__, processing_time_seconds=0.0,
+                    )
+                    for source in req.sources
+                ],
+                overall_processing_time_seconds=0.0,
+            )
 
     return application
 

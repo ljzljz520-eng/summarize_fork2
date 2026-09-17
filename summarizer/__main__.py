@@ -55,6 +55,27 @@ Examples:
         help="Server port (default: 8000)",
     )
 
+    # ── Worker subcommand ──
+    worker_parser = subparsers.add_parser(
+        "worker",
+        help="Start an independent lease-claiming job worker",
+        description="Claim and execute queued summarization jobs from the persistent job store.",
+    )
+    worker_parser.add_argument(
+        "--jobs-dir",
+        default=None,
+        help="Persistent jobs directory (default: $SUMMARIZER_JOBS_DIR or ~/.summarizer/jobs)",
+    )
+    worker_parser.add_argument("--concurrency", type=int, default=2)
+    worker_parser.add_argument("--lease-seconds", type=float, default=30.0)
+    worker_parser.add_argument("--poll-interval", type=float, default=0.5)
+    worker_parser.add_argument(
+        "--idle-exit",
+        type=float,
+        default=None,
+        help="Exit after the queue has stayed empty for N seconds",
+    )
+
     # ── Summarization arguments (main parser) ──
     # Config file options
     parser.add_argument(
@@ -277,6 +298,19 @@ def cli():
         print(f"API docs: http://{args.host}:{args.port}/docs")
         uvicorn.run("summarizer.server:app", host=args.host, port=args.port, reload=False)
         return
+
+    # Handle worker subcommand
+    if args.command == "worker":
+        from summarizer.jobs.worker import main as worker_main
+
+        argv = ["--concurrency", str(args.concurrency),
+                "--lease-seconds", str(args.lease_seconds),
+                "--poll-interval", str(args.poll_interval)]
+        if args.jobs_dir:
+            argv += ["--jobs-dir", args.jobs_dir]
+        if args.idle_exit is not None:
+            argv += ["--idle-exit", str(args.idle_exit)]
+        sys.exit(worker_main(argv))
 
     # Handle --init-config
     if args.init_config:
